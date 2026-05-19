@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 from ._exceptions import IngestionError, IngestionTimeout
 from ._models import (
     BatchIngestItem,
@@ -42,6 +44,14 @@ from ._tools import as_anthropic_tools, as_langchain_tools, as_openai_tools
 from ._transport import AsyncTransport, SyncTransport
 from .mcp import MCPConfig
 
+# Direct PUTs to Convex storage need a generous timeout — large PDFs over slow
+# connections can take a while. Separate from the SDK's API-call timeout.
+_DIRECT_UPLOAD_TIMEOUT = 300.0
+
+
+def _mime_for(path: Path) -> str:
+    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
 
 # ── Sync resource namespaces ──────────────────────────────────────────────────
 
@@ -52,6 +62,38 @@ class IngestResource:
     def __init__(self, transport: SyncTransport) -> None:
         self._t = transport
 
+    def _upload_one(
+        self,
+        path: Path,
+        *,
+        name: Optional[str],
+        group_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Direct-to-storage upload + finalize for one file. Returns the raw
+        ``{document_id, task_id, status}`` dict from the API."""
+        mime = _mime_for(path)
+        url_resp = self._t.post("/api/v1/ingest/upload-url")
+        upload_url = url_resp["upload_url"]
+
+        # PUT bytes directly to Convex storage so the upload never touches
+        # the API server (and isn't subject to Vercel's 4.5 MB body limit).
+        # Use a fresh httpx client so we don't leak our Bearer token to Convex.
+        with path.open("rb") as fh, httpx.Client(
+            timeout=_DIRECT_UPLOAD_TIMEOUT, follow_redirects=True
+        ) as http:
+            resp = http.put(upload_url, content=fh.read(), headers={"Content-Type": mime})
+            resp.raise_for_status()
+            storage_id = resp.json()["storageId"]
+
+        body: Dict[str, Any] = {
+            "storage_id": storage_id,
+            "file_type": mime,
+            "name": name or path.name,
+        }
+        if group_id:
+            body["group_id"] = group_id
+        return self._t.post("/api/v1/ingest/finalize", json=body)
+
     def file(
         self,
         path: str | Path,
@@ -60,6 +102,10 @@ class IngestResource:
         group_id: Optional[str] = None,
     ) -> IngestResult:
         """Upload a single file and queue it for parsing.
+
+        Uploads the file bytes directly to Polyvia's storage backend (no
+        API-server proxy), so there is no practical file-size cap from the
+        SDK itself.
 
         Parameters
         ----------
@@ -76,20 +122,7 @@ class IngestResource:
             Contains ``document_id`` and ``task_id``. Poll
             :meth:`status` or call :meth:`wait` to track progress.
         """
-        p = Path(path)
-        mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-        data: Dict[str, str] = {}
-        if name:
-            data["name"] = name
-        if group_id:
-            data["group_id"] = group_id
-
-        with p.open("rb") as fh:
-            raw = self._t.post(
-                "/api/v1/ingest",
-                files={"file": (p.name, fh, mime)},
-                data=data or None,
-            )
+        raw = self._upload_one(Path(path), name=name, group_id=group_id)
         return IngestResult(**raw)
 
     def batch(
@@ -99,7 +132,9 @@ class IngestResource:
         names: Optional[List[str]] = None,
         group_id: Optional[str] = None,
     ) -> BatchIngestResult:
-        """Upload multiple files in a single request.
+        """Upload multiple files. Each file is uploaded directly to storage
+        and finalized independently — a failure on one file doesn't affect
+        the others.
 
         Parameters
         ----------
@@ -110,26 +145,20 @@ class IngestResource:
         group_id:
             Assign all documents to the same group.
         """
-        files = []
-        for p in paths:
-            p = Path(p)
-            mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-            files.append(("files", (p.name, open(p, "rb"), mime)))  # noqa: SIM115
+        results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for i, raw_path in enumerate(paths):
+            p = Path(raw_path)
+            display_name = names[i] if names and i < len(names) else None
+            try:
+                results.append(self._upload_one(p, name=display_name, group_id=group_id))
+            except Exception as e:
+                err = {"file": p.name, "error": str(e)}
+                results.append(err)
+                errors.append(err)
 
-        data: Dict[str, str] = {}
-        if names:
-            data["names"] = ",".join(names)
-        if group_id:
-            data["group_id"] = group_id
-
-        try:
-            raw = self._t.post("/api/v1/ingest/batch", files=files, data=data or None)
-        finally:
-            for _, (_, fh, _) in files:
-                fh.close()
-
-        items = [BatchIngestItem(**r) for r in raw["results"]]
-        return BatchIngestResult(results=items, errors=raw.get("errors"))
+        items = [BatchIngestItem(**r) for r in results]
+        return BatchIngestResult(results=items, errors=errors or None)
 
     def status(self, task_id: str) -> IngestionStatus:
         """Return the current status of an ingestion task."""
@@ -452,6 +481,35 @@ class AsyncIngestResource:
     def __init__(self, transport: AsyncTransport) -> None:
         self._t = transport
 
+    async def _upload_one(
+        self,
+        path: Path,
+        *,
+        name: Optional[str],
+        group_id: Optional[str],
+    ) -> Dict[str, Any]:
+        mime = _mime_for(path)
+        url_resp = await self._t.post("/api/v1/ingest/upload-url")
+        upload_url = url_resp["upload_url"]
+
+        with path.open("rb") as fh:
+            data = fh.read()
+        async with httpx.AsyncClient(
+            timeout=_DIRECT_UPLOAD_TIMEOUT, follow_redirects=True
+        ) as http:
+            resp = await http.put(upload_url, content=data, headers={"Content-Type": mime})
+            resp.raise_for_status()
+            storage_id = resp.json()["storageId"]
+
+        body: Dict[str, Any] = {
+            "storage_id": storage_id,
+            "file_type": mime,
+            "name": name or path.name,
+        }
+        if group_id:
+            body["group_id"] = group_id
+        return await self._t.post("/api/v1/ingest/finalize", json=body)
+
     async def file(
         self,
         path: str | Path,
@@ -459,19 +517,7 @@ class AsyncIngestResource:
         name: Optional[str] = None,
         group_id: Optional[str] = None,
     ) -> IngestResult:
-        p = Path(path)
-        mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-        data: Dict[str, str] = {}
-        if name:
-            data["name"] = name
-        if group_id:
-            data["group_id"] = group_id
-        with p.open("rb") as fh:
-            raw = await self._t.post(
-                "/api/v1/ingest",
-                files={"file": (p.name, fh, mime)},
-                data=data or None,
-            )
+        raw = await self._upload_one(Path(path), name=name, group_id=group_id)
         return IngestResult(**raw)
 
     async def batch(
@@ -481,23 +527,20 @@ class AsyncIngestResource:
         names: Optional[List[str]] = None,
         group_id: Optional[str] = None,
     ) -> BatchIngestResult:
-        files = []
-        for p in paths:
-            p = Path(p)
-            mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-            files.append(("files", (p.name, open(p, "rb"), mime)))  # noqa: SIM115
-        data: Dict[str, str] = {}
-        if names:
-            data["names"] = ",".join(names)
-        if group_id:
-            data["group_id"] = group_id
-        try:
-            raw = await self._t.post("/api/v1/ingest/batch", files=files, data=data or None)
-        finally:
-            for _, (_, fh, _) in files:
-                fh.close()
-        items = [BatchIngestItem(**r) for r in raw["results"]]
-        return BatchIngestResult(results=items, errors=raw.get("errors"))
+        results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        for i, raw_path in enumerate(paths):
+            p = Path(raw_path)
+            display_name = names[i] if names and i < len(names) else None
+            try:
+                results.append(await self._upload_one(p, name=display_name, group_id=group_id))
+            except Exception as e:
+                err = {"file": p.name, "error": str(e)}
+                results.append(err)
+                errors.append(err)
+
+        items = [BatchIngestItem(**r) for r in results]
+        return BatchIngestResult(results=items, errors=errors or None)
 
     async def status(self, task_id: str) -> IngestionStatus:
         raw = await self._t.get(f"/api/v1/ingest/{task_id}")

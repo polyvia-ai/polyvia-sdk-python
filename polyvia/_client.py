@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
-from ._exceptions import IngestionError, IngestionTimeout
+from ._exceptions import IngestionError, IngestionTimeout, NotFoundError
 from ._models import (
     BatchIngestItem,
     BatchIngestResult,
@@ -44,9 +44,20 @@ from ._tools import as_anthropic_tools, as_langchain_tools, as_openai_tools
 from ._transport import AsyncTransport, SyncTransport
 from .mcp import MCPConfig
 
-# Direct PUTs to Convex storage need a generous timeout — large PDFs over slow
-# connections can take a while. Separate from the SDK's API-call timeout.
+# Direct uploads to Convex storage need a generous timeout — large PDFs over
+# slow connections can take a while. Separate from the SDK's API-call timeout.
 _DIRECT_UPLOAD_TIMEOUT = 300.0
+
+# The ingest-status endpoint tracks tasks in memory, so on serverless backends a
+# poll can land on a different instance and 404 even for a live task. When that
+# happens we fall back to the document's persisted status (the source of truth),
+# mapping its document-status vocabulary onto the ingestion-status one.
+_DOC_STATUS_TO_TASK = {
+    "uploading": "pending",
+    "parsing": "parsing",
+    "completed": "completed",
+    "failed": "failed",
+}
 
 
 def _mime_for(path: Path) -> str:
@@ -81,7 +92,8 @@ class IngestResource:
         with path.open("rb") as fh, httpx.Client(
             timeout=_DIRECT_UPLOAD_TIMEOUT, follow_redirects=True
         ) as http:
-            resp = http.put(upload_url, content=fh.read(), headers={"Content-Type": mime})
+            # Convex storage upload URLs require POST (PUT returns 405).
+            resp = http.post(upload_url, content=fh.read(), headers={"Content-Type": mime})
             resp.raise_for_status()
             storage_id = resp.json()["storageId"]
 
@@ -161,9 +173,23 @@ class IngestResource:
         return BatchIngestResult(results=items, errors=errors or None)
 
     def status(self, task_id: str) -> IngestionStatus:
-        """Return the current status of an ingestion task."""
-        raw = self._t.get(f"/api/v1/ingest/{task_id}")
-        return IngestionStatus(**raw)
+        """Return the current status of an ingestion task.
+
+        Falls back to the document's persisted status if the in-memory
+        ingest-status endpoint can't find the task (e.g. the poll hit a
+        different serverless instance than the one that started it).
+        """
+        try:
+            raw = self._t.get(f"/api/v1/ingest/{task_id}")
+            return IngestionStatus(**raw)
+        except NotFoundError:
+            doc = self._t.get(f"/api/v1/documents/{task_id}")
+            return IngestionStatus(
+                task_id=task_id,
+                document_id=doc.get("id"),
+                status=_DOC_STATUS_TO_TASK.get(doc.get("status", ""), doc.get("status", "")),
+                error=None,
+            )
 
     def wait(
         self,
@@ -497,7 +523,8 @@ class AsyncIngestResource:
         async with httpx.AsyncClient(
             timeout=_DIRECT_UPLOAD_TIMEOUT, follow_redirects=True
         ) as http:
-            resp = await http.put(upload_url, content=data, headers={"Content-Type": mime})
+            # Convex storage upload URLs require POST (PUT returns 405).
+            resp = await http.post(upload_url, content=data, headers={"Content-Type": mime})
             resp.raise_for_status()
             storage_id = resp.json()["storageId"]
 
@@ -543,8 +570,17 @@ class AsyncIngestResource:
         return BatchIngestResult(results=items, errors=errors or None)
 
     async def status(self, task_id: str) -> IngestionStatus:
-        raw = await self._t.get(f"/api/v1/ingest/{task_id}")
-        return IngestionStatus(**raw)
+        try:
+            raw = await self._t.get(f"/api/v1/ingest/{task_id}")
+            return IngestionStatus(**raw)
+        except NotFoundError:
+            doc = await self._t.get(f"/api/v1/documents/{task_id}")
+            return IngestionStatus(
+                task_id=task_id,
+                document_id=doc.get("id"),
+                status=_DOC_STATUS_TO_TASK.get(doc.get("status", ""), doc.get("status", "")),
+                error=None,
+            )
 
     async def wait(
         self,

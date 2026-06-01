@@ -37,6 +37,20 @@ class BatchIngestResult(BaseModel):
     results: List[BatchIngestItem]
     errors: Optional[List[Dict[str, str]]] = None
 
+    # Behave like a sequence of items so ``for item in batch``, ``batch[0]`` and
+    # ``len(batch)`` work as expected. Without these, Pydantic v2's default
+    # ``__iter__`` yields ``(field_name, value)`` tuples, so ``for item in batch:
+    # item.task_id`` raised ``'tuple' object has no attribute 'task_id'``.
+    # ``batch.results`` / ``batch.errors`` keep working unchanged.
+    def __iter__(self):  # type: ignore[override]
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(self, index: int) -> "BatchIngestItem":
+        return self.results[index]
+
 
 class IngestionStatus(BaseModel):
     """Returned by ingest.status() and ingest.wait()."""
